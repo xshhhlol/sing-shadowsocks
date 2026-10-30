@@ -5,10 +5,10 @@ import (
 	"errors"
 	"net"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-shadowsocks/internal/testutil"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -48,13 +48,13 @@ func TestHandshakeAdmissionRejectsBeforeParsing(t *testing.T) {
 	if err != nil {
 		// An immediate server reset can reach Darwin's dialer before Dial
 		// returns. It is the same observable reset as the read path below.
-		if !errors.Is(err, syscall.ECONNRESET) {
+		if !testutil.IsConnectionReset(err) {
 			t.Fatal(err)
 		}
 	} else {
 		defer client.Close()
 		client.SetReadDeadline(time.Now().Add(time.Second))
-		if _, err := client.Read(make([]byte, 1)); !errors.Is(err, syscall.ECONNRESET) {
+		if _, err := client.Read(make([]byte, 1)); !testutil.IsConnectionReset(err) {
 			t.Fatalf("overload close differed: %v", err)
 		}
 	}

@@ -1,6 +1,6 @@
 module github.com/sagernet/sing-shadowsocks
 
-go 1.18
+go 1.20
 
 require (
 	github.com/sagernet/sing v0.6.10

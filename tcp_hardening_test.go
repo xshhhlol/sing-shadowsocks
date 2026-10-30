@@ -7,11 +7,11 @@ import (
 	"io"
 	"net"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
 	ss "github.com/sagernet/sing-shadowsocks"
+	"github.com/sagernet/sing-shadowsocks/internal/testutil"
 	old "github.com/sagernet/sing-shadowsocks/shadowaead"
 	modern "github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	"github.com/sagernet/sing/common"
@@ -140,7 +140,7 @@ func realTCPFailure(t *testing.T, f *fixture, packet []byte, halfClose bool) {
 		}
 	}
 	n, readErr := client.Read(make([]byte, 128))
-	if n != 0 || !errors.Is(readErr, syscall.ECONNRESET) {
+	if n != 0 || !testutil.IsConnectionReset(readErr) {
 		t.Fatalf("failure produced data or different close behavior: %d %v", n, readErr)
 	}
 	elapsed := time.Since(start)
