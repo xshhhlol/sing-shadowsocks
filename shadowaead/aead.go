@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/sagernet/sing-shadowsocks"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -297,6 +298,9 @@ type Writer struct {
 	buffer        []byte
 	nonce         []byte
 	access        sync.Mutex
+	shaping       shadowsocks.TrafficShapingOptions
+	shapingLeft   int
+	writeErr      error
 }
 
 func NewWriter(upstream io.Writer, cipher cipher.AEAD, maxPacketSize int) *Writer {
@@ -323,93 +327,133 @@ func (w *Writer) Upstream() any {
 	return w.upstream
 }
 
+// writeWire is called with access held. A partial encrypted write is fatal:
+// advancing the nonce and retrying a whole record would corrupt the stream.
+func (w *Writer) writeWire(data []byte) error {
+	if w.writeErr != nil {
+		return w.writeErr
+	}
+	n, err := w.upstream.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.writeErr = err
+	}
+	return err
+}
+
+func (w *Writer) encodeRecord(index int, payload []byte) int {
+	output := w.buffer[index:]
+	binary.BigEndian.PutUint16(output[:PacketLengthBufferSize], uint16(len(payload)))
+	w.cipher.Seal(output[:0], w.nonce, output[:PacketLengthBufferSize], nil)
+	increaseNonce(w.nonce)
+	offset := Overhead + PacketLengthBufferSize
+	packet := w.cipher.Seal(output[offset:offset], w.nonce, payload, nil)
+	increaseNonce(w.nonce)
+	return index + offset + len(packet)
+}
+
 func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
+	payload := buf.NewSize(w.maxPacketSize)
+	defer payload.Release()
+	empty := 0
 	for {
-		offset := Overhead + PacketLengthBufferSize
-		readN, readErr := r.Read(w.buffer[offset : offset+w.maxPacketSize])
+		count, readErr := r.Read(payload.FreeBytes())
+		if count > 0 {
+			empty = 0
+			written, writeErr := w.Write(payload.FreeBytes()[:count])
+			n += int64(written)
+			if writeErr != nil {
+				return n, writeErr
+			}
+		} else if readErr == nil {
+			empty++
+			if empty >= 100 {
+				return n, io.ErrNoProgress
+			}
+		}
 		if readErr != nil {
-			return 0, readErr
+			if readErr == io.EOF {
+				readErr = nil
+			}
+			return n, readErr
 		}
-		binary.BigEndian.PutUint16(w.buffer[:PacketLengthBufferSize], uint16(readN))
-		w.cipher.Seal(w.buffer[:0], w.nonce, w.buffer[:PacketLengthBufferSize], nil)
-		increaseNonce(w.nonce)
-		packet := w.cipher.Seal(w.buffer[offset:offset], w.nonce, w.buffer[offset:offset+readN], nil)
-		increaseNonce(w.nonce)
-		_, err = w.upstream.Write(w.buffer[:offset+len(packet)])
-		if err != nil {
-			return
-		}
-		n += int64(readN)
 	}
 }
 
-func (w *Writer) Write(p []byte) (n int, err error) {
+func (w *Writer) Write(p []byte) (int, error) {
+	w.access.Lock()
+	defer w.access.Unlock()
+	return w.writePayload(p, nil)
+}
+
+// writePayload preserves the initial salt/header and first payload in one
+// underlying write. The caller owns access and supplies non-aliasing input.
+func (w *Writer) writePayload(p, prefix []byte) (n int, err error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
 	if len(p) == 0 {
+		if len(prefix) > 0 {
+			err = w.writeWire(prefix)
+		}
 		return
 	}
-
-	for pLen := len(p); pLen > 0; {
-		var data []byte
-		if pLen > w.maxPacketSize {
-			data = p[:w.maxPacketSize]
-			p = p[w.maxPacketSize:]
-			pLen -= w.maxPacketSize
-		} else {
-			data = p
-			pLen = 0
+	for len(p) > 0 {
+		limit := len(w.buffer) - len(prefix) - PacketLengthBufferSize - 2*Overhead
+		if limit > len(p) {
+			limit = len(p)
 		}
-		w.access.Lock()
-		binary.BigEndian.PutUint16(w.buffer[:PacketLengthBufferSize], uint16(len(data)))
-		w.cipher.Seal(w.buffer[:0], w.nonce, w.buffer[:PacketLengthBufferSize], nil)
-		increaseNonce(w.nonce)
-		offset := Overhead + PacketLengthBufferSize
-		packet := w.cipher.Seal(w.buffer[offset:offset], w.nonce, data, nil)
-		increaseNonce(w.nonce)
-		w.access.Unlock()
-		_, err = w.upstream.Write(w.buffer[:offset+len(packet)])
-		if err != nil {
+		size := w.SelectPayloadSize(limit)
+		copy(w.buffer, prefix)
+		end := w.encodeRecord(len(prefix), p[:size])
+		if err = w.writeWire(w.buffer[:end]); err != nil {
 			return
 		}
-		n += len(data)
+		n += size
+		p = p[size:]
+		prefix = nil
 	}
-
 	return
 }
 
 func (w *Writer) WriteVectorised(buffers []*buf.Buffer) error {
 	defer buf.ReleaseMulti(buffers)
-	var index int
-	var err error
+	w.access.Lock()
+	defer w.access.Unlock()
+	if w.writeErr != nil {
+		return w.writeErr
+	}
+	index := 0
+	flush := func() error {
+		if index == 0 {
+			return nil
+		}
+		err := w.writeWire(w.buffer[:index])
+		index = 0
+		return err
+	}
 	for _, buffer := range buffers {
-		pLen := buffer.Len()
-		if pLen > w.maxPacketSize {
-			_, err = w.Write(buffer.Bytes())
-			if err != nil {
-				return err
-			}
-		} else {
-			if cap(w.buffer) < index+PacketLengthBufferSize+pLen+2*Overhead {
-				_, err = w.upstream.Write(w.buffer[:index])
-				index = 0
-				if err != nil {
+		payload := buffer.Bytes()
+		for len(payload) > 0 {
+			shaped := w.shapingLeft > 0
+			size := w.SelectPayloadSize(len(payload))
+			if index+size+PacketLengthBufferSize+2*Overhead > len(w.buffer) {
+				if err := flush(); err != nil {
 					return err
 				}
 			}
-			w.access.Lock()
-			binary.BigEndian.PutUint16(w.buffer[index:index+PacketLengthBufferSize], uint16(pLen))
-			w.cipher.Seal(w.buffer[index:index], w.nonce, w.buffer[index:index+PacketLengthBufferSize], nil)
-			increaseNonce(w.nonce)
-			offset := index + Overhead + PacketLengthBufferSize
-			w.cipher.Seal(w.buffer[offset:offset], w.nonce, buffer.Bytes(), nil)
-			increaseNonce(w.nonce)
-			w.access.Unlock()
-			index = offset + pLen + Overhead
+			index = w.encodeRecord(index, payload[:size])
+			payload = payload[size:]
+			if shaped {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	if index > 0 {
-		_, err = w.upstream.Write(w.buffer[:index])
-	}
-	return err
+	return flush()
 }
 
 func (w *Writer) Buffer() *buf.Buffer {
@@ -454,9 +498,25 @@ func (w *BufferedWriter) Write(p []byte) (n int, err error) {
 }
 
 func (w *BufferedWriter) Flush() error {
+	writer := w.upstream
+	writer.access.Lock()
+	defer writer.access.Unlock()
+	if writer.writeErr != nil {
+		return writer.writeErr
+	}
+	if writer.shapingLeft > 0 && w.index > 0 {
+		// Buffered plaintext overlaps the output buffer. Preserve it before
+		// splitting it into independently authenticated records.
+		payload := append([]byte(nil), w.data[w.reversed:w.reversed+w.index]...)
+		prefix := append([]byte(nil), writer.buffer[:w.reversed]...)
+		_, err := writer.writePayload(payload, prefix)
+		w.reversed = 0
+		w.index = 0
+		return err
+	}
 	if w.index == 0 {
 		if w.reversed > 0 {
-			_, err := w.upstream.upstream.Write(w.upstream.buffer[:w.reversed])
+			err := writer.writeWire(w.upstream.buffer[:w.reversed])
 			w.reversed = 0
 			return err
 		}
@@ -469,7 +529,7 @@ func (w *BufferedWriter) Flush() error {
 	offset := Overhead + PacketLengthBufferSize
 	packet := w.upstream.cipher.Seal(buffer[offset:offset], w.upstream.nonce, buffer[offset:offset+w.index], nil)
 	increaseNonce(w.upstream.nonce)
-	_, err := w.upstream.upstream.Write(w.upstream.buffer[:w.reversed+offset+len(packet)])
+	err := writer.writeWire(w.upstream.buffer[:w.reversed+offset+len(packet)])
 	w.reversed = 0
 	w.index = 0
 	return err

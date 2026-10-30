@@ -1,8 +1,10 @@
 package shadowaead
 
 import (
+	"bytes"
 	"context"
 	"crypto/cipher"
+	"crypto/sha256"
 	"io"
 	"net"
 	"net/netip"
@@ -25,14 +27,21 @@ type MultiService[U comparable] struct {
 	access    sync.RWMutex
 	methodMap map[U]*Method
 	handler   shadowsocks.Handler
-	udpNat    *udpnat.Service[netip.AddrPort]
+	udpNat    *udpnat.Service[userSource[U]]
+	salts     saltHistory
+}
+
+type userSource[U comparable] struct {
+	user   U
+	source netip.AddrPort
+	key    [32]byte
 }
 
 func NewMultiService[U comparable](method string, udpTimeout int64, handler shadowsocks.Handler) (*MultiService[U], error) {
 	s := &MultiService[U]{
 		name:    method,
 		handler: handler,
-		udpNat:  udpnat.New[netip.AddrPort](udpTimeout, handler),
+		udpNat:  udpnat.New[userSource[U]](udpTimeout, handler),
 	}
 	return s, nil
 }
@@ -41,13 +50,30 @@ func (s *MultiService[U]) Name() string {
 	return s.name
 }
 
+func (s *MultiService[U]) Contains(user U) bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	_, exists := s.methodMap[user]
+	return exists
+}
+
 func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
+	if len(userList) != len(keyList) {
+		return shadowsocks.ErrBadKey
+	}
+	s.access.RLock()
+	previous := s.methodMap
+	s.access.RUnlock()
 	methodMap := make(map[U]*Method)
 	for i, user := range userList {
 		key := keyList[i]
 		method, err := New(s.name, key, "")
 		if err != nil {
 			return err
+		}
+		method.salts = &s.salts
+		if old := previous[user]; old != nil && bytes.Equal(old.key, method.key) {
+			method = old
 		}
 		methodMap[user] = method
 	}
@@ -58,12 +84,22 @@ func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
 }
 
 func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
+	if len(userList) != len(passwordList) {
+		return shadowsocks.ErrBadKey
+	}
+	s.access.RLock()
+	previous := s.methodMap
+	s.access.RUnlock()
 	methodMap := make(map[U]*Method)
 	for i, user := range userList {
 		password := passwordList[i]
 		method, err := New(s.name, nil, password)
 		if err != nil {
 			return err
+		}
+		method.salts = &s.salts
+		if old := previous[user]; old != nil && bytes.Equal(old.key, method.key) {
+			method = old
 		}
 		methodMap[user] = method
 	}
@@ -74,14 +110,12 @@ func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []
 }
 
 func (s *MultiService[U]) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	err := s.newConnection(ctx, conn, metadata)
-	if err != nil {
-		err = &shadowsocks.ServerConnError{Conn: conn, Source: metadata.Source, Cause: err}
-	}
-	return err
+	return shadowsocks.HandleServerConnection(ctx, conn, metadata, func(complete func() error) error {
+		return s.newConnection(ctx, conn, metadata, complete)
+	})
 }
 
-func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata, complete func() error) error {
 	s.access.RLock()
 	methodMap := s.methodMap
 	s.access.RUnlock()
@@ -114,11 +148,16 @@ func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, meta
 		if err != nil {
 			return err
 		}
-		reader = NewReader(conn, readCipher, MaxPacketSize)
-
-		err = reader.ReadWithLengthChunk(header.From(method.keySaltLength))
+		// Authenticate the two-byte length before allocating a full payload
+		// reader. Garbage connections must not allocate 16 KiB per user.
+		var length [PacketLengthBufferSize]byte
+		_, err = readCipher.Open(length[:0], rw.ZeroBytes[:readCipher.NonceSize()], header.From(m.keySaltLength), nil)
 		if err != nil {
 			continue
+		}
+		reader = NewReader(conn, readCipher, MaxPacketSize)
+		if err = reader.ReadWithLengthChunk(header.From(m.keySaltLength)); err != nil {
+			return err
 		}
 
 		user, method = u, m
@@ -132,14 +171,21 @@ func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, meta
 	if err != nil {
 		return err
 	}
+	if !method.checkSalt(header.To(method.keySaltLength), false) {
+		return ErrReplay
+	}
 
+	if err := complete(); err != nil {
+		return err
+	}
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 
 	return s.handler.NewConnection(auth.ContextWithUser(ctx, user), &serverConn{
-		Method: method,
-		Conn:   conn,
-		reader: reader,
+		Method:  method,
+		Conn:    conn,
+		reader:  reader,
+		shaping: shadowsocks.ServerOptionsFromContext(ctx).TrafficShaping,
 	}, metadata)
 }
 
@@ -173,6 +219,7 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 	var readCipher cipher.AEAD
 	var err error
 	decrypted := make([]byte, 0, buffer.Len())
+	salt := append([]byte(nil), buffer.To(method.keySaltLength)...)
 	for u, m := range methodMap {
 		key := buf.NewSize(m.keySaltLength)
 		Kdf(m.key, buffer.To(m.keySaltLength), key)
@@ -202,10 +249,13 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 	if err != nil {
 		return err
 	}
+	if !method.checkSalt(salt, true) {
+		return ErrReplay
+	}
 
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
-	s.udpNat.NewPacket(auth.ContextWithUser(ctx, user), metadata.Source.AddrPort(), buffer, metadata, func(natConn N.PacketConn) N.PacketWriter {
+	s.udpNat.NewPacket(auth.ContextWithUser(ctx, user), userSource[U]{user, metadata.Source.AddrPort(), sha256.Sum256(method.key)}, buffer, metadata, func(natConn N.PacketConn) N.PacketWriter {
 		return &serverPacketWriter{method, conn, natConn}
 	})
 	return nil

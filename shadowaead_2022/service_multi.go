@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"io"
-	"math"
 	"net"
 	"os"
 	"sync"
@@ -72,6 +71,9 @@ func NewMultiService[U comparable](method string, iPSK []byte, udpTimeout int64,
 }
 
 func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
+	if len(userList) != len(keyList) {
+		return shadowsocks.ErrBadKey
+	}
 	uPSK := make(map[U][]byte)
 	uPSKHash := make(map[[aes.BlockSize]byte]U)
 	uCipher := make(map[U]cipher.Block)
@@ -105,6 +107,9 @@ func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
 }
 
 func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
+	if len(userList) != len(passwordList) {
+		return shadowsocks.ErrBadKey
+	}
 	keyList := make([][]byte, 0, len(passwordList))
 	for _, password := range passwordList {
 		if password == "" {
@@ -119,15 +124,24 @@ func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []
 	return s.UpdateUsers(userList, keyList)
 }
 
+func (s *MultiService[U]) Contains(user U) bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	_, exists := s.uPSK[user]
+	return exists
+}
+
 func (s *MultiService[U]) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	err := s.NewConnection0(ctx, conn, metadata, conn, nil)
-	if err != nil {
-		err = &shadowsocks.ServerConnError{Conn: conn, Source: metadata.Source, Cause: err}
-	}
-	return err
+	return s.NewConnection0(ctx, conn, metadata, conn, nil)
 }
 
 func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, metadata M.Metadata, handshakeReader io.Reader, handshakeSuccess func()) error {
+	return shadowsocks.HandleServerConnection(ctx, conn, metadata, func(complete func() error) error {
+		return s.newConnection0(ctx, conn, metadata, handshakeReader, handshakeSuccess, complete)
+	})
+}
+
+func (s *MultiService[U]) newConnection0(ctx context.Context, conn net.Conn, metadata M.Metadata, handshakeReader io.Reader, handshakeSuccess func(), complete func() error) error {
 	requestHeader := make([]byte, s.keySaltLength+aes.BlockSize+shadowaead.Overhead+RequestHeaderFixedChunkLength)
 	var (
 		n   int
@@ -144,10 +158,6 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return shadowaead.ErrBadHeader
 	}
 	requestSalt := requestHeader[:s.keySaltLength]
-	if !s.replayFilter.Check(requestSalt) {
-		return ErrSaltNotUnique
-	}
-
 	var _eiHeader [aes.BlockSize]byte
 	eiHeader := _eiHeader[:]
 	copy(eiHeader, requestHeader[s.keySaltLength:s.keySaltLength+aes.BlockSize])
@@ -207,9 +217,8 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	if err != nil {
 		return E.Cause(err, "read timestamp")
 	}
-	diff := int(math.Abs(float64(s.time().Unix() - int64(epoch))))
-	if diff > 30 {
-		return E.Extend(ErrBadTimestamp, "received ", epoch, ", diff ", diff, "s")
+	if !validTimestamp(epoch, s.time().Unix()) {
+		return E.Extend(ErrBadTimestamp, "received ", epoch)
 	}
 	var length uint16
 	err = binary.Read(reader, binary.BigEndian, &length)
@@ -244,15 +253,25 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return ErrNoPadding
 	}
 
+	if !validTimestamp(epoch, s.time().Unix()) {
+		return ErrBadTimestamp
+	}
+	if !s.replayFilter.Check(requestSalt) {
+		return ErrSaltNotUnique
+	}
 	protocolConn := &serverConn{
 		Service:     s.Service,
 		Conn:        conn,
 		uPSK:        uPSK,
 		headerType:  headerType,
 		requestSalt: requestSalt,
+		shaping:     shadowsocks.ServerOptionsFromContext(ctx).TrafficShaping,
 	}
 
 	protocolConn.reader = reader
+	if err := complete(); err != nil {
+		return err
+	}
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	return s.handler.NewConnection(auth.ContextWithUser(ctx, user), protocolConn, metadata)
@@ -306,6 +325,10 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 	session, loaded := s.udpSessions.LoadOrStore(sessionId, func() *serverUDPSession {
 		return s.newUDPSession(uPSK)
 	})
+	// An identity header must not select another user's cached session cipher.
+	if session.remoteKeyHash != blake3.Sum256(uPSK) {
+		return E.New("invalid request")
+	}
 	if !loaded {
 		session.remoteSessionId = sessionId
 		key := SessionKey(uPSK, packetHeader[:8], s.keySaltLength)
@@ -338,8 +361,6 @@ process:
 		buffer.Truncate(buffer.Len() - shadowaead.Overhead)
 	}
 
-	session.window.Add(packetId)
-
 	var headerType byte
 	headerType, err = buffer.ReadByte()
 	if err != nil {
@@ -356,9 +377,8 @@ process:
 	if err != nil {
 		goto returnErr
 	}
-	diff := int(math.Abs(float64(s.time().Unix() - int64(epoch))))
-	if diff > 30 {
-		err = E.Extend(ErrBadTimestamp, "received ", epoch, ", diff ", diff, "s")
+	if !validTimestamp(epoch, s.time().Unix()) {
+		err = E.Extend(ErrBadTimestamp, "received ", epoch)
 		goto returnErr
 	}
 
@@ -379,16 +399,17 @@ process:
 		goto returnErr
 	}
 
+	session.window.Add(packetId)
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
-		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, uCipher}
+		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, uCipher, shadowsocks.ServerOptionsFromContext(ctx).UDPPadding}
 	})
 	return nil
 }
 
 func (s *MultiService[U]) newUDPSession(uPSK []byte) *serverUDPSession {
-	session := &serverUDPSession{}
+	session := &serverUDPSession{remoteKeyHash: blake3.Sum256(uPSK)}
 	if s.udpCipher != nil {
 		session.rng = Blake3KeyedHash(rand.Reader)
 		common.Must(binary.Read(session.rng, binary.BigEndian, &session.sessionId))

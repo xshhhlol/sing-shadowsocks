@@ -1,15 +1,23 @@
+version: "2"
 linters:
-  disable-all: true
+  default: none
+  enable:
+    - govet
+    - staticcheck
+  settings:
+    staticcheck:
+      # Keep the exported legacy sing handler API source-compatible. Its
+      # deprecation and existing switch-style suggestions are not migrations
+      # required by this protocol hardening release.
+      checks: ["all", "-SA1019", "-QF1003"]
+formatters:
   enable:
     - gofumpt
-    - govet
     - gci
-    - staticcheck
-
-linters-settings:
-  gci:
-    custom-order: true
-    sections:
-      - standard
-      - prefix(github.com/sagernet/)
-      - default
+  settings:
+    gci:
+      custom-order: true
+      sections:
+        - standard
+        - prefix(github.com/sagernet/)
+        - default

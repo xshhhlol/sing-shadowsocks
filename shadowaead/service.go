@@ -51,14 +51,12 @@ func (s *Service) Password() string {
 }
 
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	err := s.newConnection(ctx, conn, metadata)
-	if err != nil {
-		err = &shadowsocks.ServerConnError{Conn: conn, Source: metadata.Source, Cause: err}
-	}
-	return err
+	return shadowsocks.HandleServerConnection(ctx, conn, metadata, func(complete func() error) error {
+		return s.newConnection(ctx, conn, metadata, complete)
+	})
 }
 
-func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata, complete func() error) error {
 	header := buf.NewSize(s.keySaltLength + PacketLengthBufferSize + Overhead)
 	defer header.Release()
 
@@ -87,14 +85,21 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.M
 	if err != nil {
 		return err
 	}
+	if !s.checkSalt(header.To(s.keySaltLength), false) {
+		return ErrReplay
+	}
 
+	if err := complete(); err != nil {
+		return err
+	}
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 
 	return s.handler.NewConnection(ctx, &serverConn{
-		Method: s.Method,
-		Conn:   conn,
-		reader: reader,
+		Method:  s.Method,
+		Conn:    conn,
+		reader:  reader,
+		shaping: shadowsocks.ServerOptionsFromContext(ctx).TrafficShaping,
 	}, metadata)
 }
 
@@ -105,14 +110,20 @@ func (s *Service) NewError(ctx context.Context, err error) {
 type serverConn struct {
 	*Method
 	net.Conn
-	access sync.Mutex
-	reader *Reader
-	writer *Writer
+	access   sync.Mutex
+	reader   *Reader
+	writer   *Writer
+	shaping  shadowsocks.TrafficShapingOptions
+	writeErr error
 }
 
 func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
 	salt := buf.NewSize(c.keySaltLength)
 	salt.WriteRandom(c.keySaltLength)
+	for !c.checkSalt(salt.Bytes(), false) {
+		salt.Reset()
+		salt.WriteRandom(c.keySaltLength)
+	}
 
 	key := buf.NewSize(c.keySaltLength)
 
@@ -124,6 +135,10 @@ func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
 		return
 	}
 	writer := NewWriter(c.Conn, writeCipher, MaxPacketSize)
+	if err = writer.EnableTrafficShaping(c.shaping); err != nil {
+		salt.Release()
+		return
+	}
 
 	header := writer.Buffer()
 	common.Must1(header.Write(salt.Bytes()))
@@ -151,16 +166,23 @@ func (c *serverConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *serverConn) Write(p []byte) (n int, err error) {
-	if c.writer != nil {
-		return c.writer.Write(p)
+	if len(p) == 0 {
+		return 0, nil
 	}
 	c.access.Lock()
-	if c.writer != nil {
-		c.access.Unlock()
-		return c.writer.Write(p)
-	}
 	defer c.access.Unlock()
-	return c.writeResponse(p)
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	if c.writer != nil {
+		n, err = c.writer.Write(p)
+	} else {
+		n, err = c.writeResponse(p)
+	}
+	if err != nil {
+		c.writeErr = err
+	}
+	return
 }
 
 func (c *serverConn) WriteTo(w io.Writer) (n int64, err error) {
@@ -201,6 +223,7 @@ func (s *Service) newPacket(ctx context.Context, conn N.PacketConn, buffer *buf.
 	if err != nil {
 		return err
 	}
+	salt := append([]byte(nil), buffer.To(s.keySaltLength)...)
 	packet, err := readCipher.Open(buffer.Index(s.keySaltLength), rw.ZeroBytes[:readCipher.NonceSize()], buffer.From(s.keySaltLength), nil)
 	if err != nil {
 		return err
@@ -211,6 +234,9 @@ func (s *Service) newPacket(ctx context.Context, conn N.PacketConn, buffer *buf.
 	destination, err := M.SocksaddrSerializer.ReadAddrPort(buffer)
 	if err != nil {
 		return err
+	}
+	if !s.checkSalt(salt, true) {
+		return ErrReplay
 	}
 
 	metadata.Protocol = "shadowsocks"
@@ -230,6 +256,9 @@ type serverPacketWriter struct {
 func (w *serverPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	header := buffer.ExtendHeader(w.keySaltLength + M.SocksaddrSerializer.AddrPortLen(destination))
 	common.Must1(io.ReadFull(rand.Reader, header[:w.keySaltLength]))
+	for !w.checkSalt(header[:w.keySaltLength], true) {
+		common.Must1(io.ReadFull(rand.Reader, header[:w.keySaltLength]))
+	}
 	err := M.SocksaddrSerializer.WriteAddrPort(buf.With(header[w.keySaltLength:]), destination)
 	if err != nil {
 		buffer.Release()

@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"io"
-	"math"
 	mRand "math/rand"
 	"net"
 	"os"
@@ -67,12 +66,19 @@ func NewServiceWithPassword(method string, password string, udpTimeout int64, ha
 }
 
 func NewService(method string, psk []byte, udpTimeout int64, handler shadowsocks.Handler, timeFunc func() time.Time) (shadowsocks.Service, error) {
+	// The session cache expires at whole Unix seconds. An age of 61 keeps
+	// the final valid timestamp second even after fractional-second rounding.
+	if udpTimeout < 61 {
+		udpTimeout = 61
+	}
 	s := &Service{
 		name:     method,
 		handler:  handler,
 		timeFunc: timeFunc,
 
-		replayFilter: replay.NewSimple(60 * time.Second),
+		// Include the final timestamp second when the client's clock is 30s
+		// ahead and its first request arrives part-way through a second.
+		replayFilter: replay.NewSimple(61 * time.Second),
 		udpNat:       udpnat.New[uint64](udpTimeout, handler),
 		udpSessions: cache.New[uint64, *serverUDPSession](
 			cache.WithAge[uint64, *serverUDPSession](udpTimeout),
@@ -130,11 +136,9 @@ func (s *Service) Password() string {
 }
 
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	err := s.newConnection(ctx, conn, metadata)
-	if err != nil {
-		err = &shadowsocks.ServerConnError{Conn: conn, Source: metadata.Source, Cause: err}
-	}
-	return err
+	return shadowsocks.HandleServerConnection(ctx, conn, metadata, func(complete func() error) error {
+		return s.newConnection(ctx, conn, metadata, complete)
+	})
 }
 
 func (s *Service) time() time.Time {
@@ -145,7 +149,7 @@ func (s *Service) time() time.Time {
 	}
 }
 
-func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata, complete func() error) error {
 	header := make([]byte, s.keySaltLength+shadowaead.Overhead+RequestHeaderFixedChunkLength)
 
 	n, err := conn.Read(header)
@@ -156,10 +160,6 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.M
 	}
 
 	requestSalt := header[:s.keySaltLength]
-
-	if !s.replayFilter.Check(requestSalt) {
-		return ErrSaltNotUnique
-	}
 
 	requestKey := SessionKey(s.psk, requestSalt, s.keySaltLength)
 	readCipher, err := s.constructor(requestKey)
@@ -192,9 +192,8 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.M
 		return err
 	}
 
-	diff := int(math.Abs(float64(s.time().Unix() - int64(epoch))))
-	if diff > 30 {
-		return E.Extend(ErrBadTimestamp, "received ", epoch, ", diff ", diff, "s")
+	if !validTimestamp(epoch, s.time().Unix()) {
+		return E.Extend(ErrBadTimestamp, "received ", epoch)
 	}
 
 	var length uint16
@@ -232,19 +231,34 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.M
 		return ErrNoPadding
 	}
 
+	if !validTimestamp(epoch, s.time().Unix()) {
+		return ErrBadTimestamp
+	}
+	if !s.replayFilter.Check(requestSalt) {
+		return ErrSaltNotUnique
+	}
 	protocolConn := &serverConn{
 		Service:     s,
 		Conn:        conn,
 		uPSK:        s.psk,
 		headerType:  headerType,
 		requestSalt: requestSalt,
+		shaping:     shadowsocks.ServerOptionsFromContext(ctx).TrafficShaping,
 	}
 
 	protocolConn.reader = reader
 
+	if err := complete(); err != nil {
+		return err
+	}
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	return s.handler.NewConnection(ctx, protocolConn, metadata)
+}
+
+func validTimestamp(epoch uint64, now int64) bool {
+	// Compare bounds instead of subtracting an untrusted uint64 timestamp.
+	return epoch < 1<<63 && int64(epoch) >= now-30 && int64(epoch) <= now+30
 }
 
 type serverConn struct {
@@ -256,6 +270,8 @@ type serverConn struct {
 	reader      *shadowaead.Reader
 	writer      *shadowaead.Writer
 	requestSalt []byte
+	shaping     shadowsocks.TrafficShapingOptions
+	writeErr    error
 }
 
 func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
@@ -273,6 +289,10 @@ func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
 		writeCipher,
 		MaxPacketSize,
 	)
+	if err = writer.EnableTrafficShaping(c.shaping); err != nil {
+		salt.Release()
+		return
+	}
 	header := writer.Buffer()
 	header.Write(salt.Bytes())
 
@@ -286,6 +306,7 @@ func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
 	if payloadLen > maxPayloadLen {
 		payloadLen = maxPayloadLen
 	}
+	payloadLen = writer.SelectPayloadSize(payloadLen)
 	common.Must(headerFixedChunk.WriteByte(headerType))
 	common.Must(binary.Write(headerFixedChunk, binary.BigEndian, uint64(c.time().Unix())))
 	common.Must1(headerFixedChunk.Write(c.requestSalt))
@@ -333,29 +354,48 @@ func (c *serverConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *serverConn) Write(p []byte) (n int, err error) {
-	if c.writer != nil {
-		return c.writer.Write(p)
+	if len(p) == 0 {
+		return 0, nil
 	}
 	c.access.Lock()
-	if c.writer != nil {
-		c.access.Unlock()
-		return c.writer.Write(p)
-	}
 	defer c.access.Unlock()
-	return c.writeResponse(p)
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	if c.writer != nil {
+		n, err = c.writer.Write(p)
+	} else {
+		n, err = c.writeResponse(p)
+	}
+	if err != nil {
+		c.writeErr = err
+	}
+	return
 }
 
-func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) error {
-	if c.writer != nil {
-		return c.writer.WriteVectorised(buffers)
+func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) (err error) {
+	for len(buffers) > 0 && buffers[0].IsEmpty() {
+		buffers[0].Release()
+		buffers = buffers[1:]
+	}
+	if len(buffers) == 0 {
+		return nil
 	}
 	c.access.Lock()
+	defer c.access.Unlock()
+	if c.writeErr != nil {
+		buf.ReleaseMulti(buffers)
+		return c.writeErr
+	}
+	defer func() {
+		if err != nil {
+			c.writeErr = err
+		}
+	}()
 	if c.writer != nil {
-		c.access.Unlock()
 		return c.writer.WriteVectorised(buffers)
 	}
-	defer c.access.Unlock()
-	_, err := c.writeResponse(buffers[0].Bytes())
+	_, err = c.writeResponse(buffers[0].Bytes())
 	if err != nil {
 		buf.ReleaseMulti(buffers)
 		return err
@@ -365,11 +405,9 @@ func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) error {
 }
 
 func (c *serverConn) Close() error {
-	return common.Close(
-		c.Conn,
-		common.PtrOrNil(c.reader),
-		common.PtrOrNil(c.writer),
-	)
+	// Reader and Writer own only Go memory, not closable resources. Closing
+	// the transport first also interrupts an in-progress concurrent write.
+	return c.Conn.Close()
 }
 
 func (c *serverConn) NeedAdditionalReadDeadline() bool {
@@ -455,8 +493,6 @@ process:
 		buffer.Truncate(buffer.Len() - shadowaead.Overhead)
 	}
 
-	session.window.Add(packetId)
-
 	var headerType byte
 	headerType, err = buffer.ReadByte()
 	if err != nil {
@@ -473,9 +509,8 @@ process:
 	if err != nil {
 		goto returnErr
 	}
-	diff := int(math.Abs(float64(s.time().Unix() - int64(epoch))))
-	if diff > 30 {
-		err = E.Extend(ErrBadTimestamp, "received ", epoch, ", diff ", diff, "s")
+	if !validTimestamp(epoch, s.time().Unix()) {
+		err = E.Extend(ErrBadTimestamp, "received ", epoch)
 		goto returnErr
 	}
 
@@ -495,10 +530,11 @@ process:
 	if err != nil {
 		goto returnErr
 	}
+	session.window.Add(packetId)
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	s.udpNat.NewPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) N.PacketWriter {
-		return &serverPacketWriter{s, conn, natConn, session, s.udpBlockCipher}
+		return &serverPacketWriter{s, conn, natConn, session, s.udpBlockCipher, shadowsocks.ServerOptionsFromContext(ctx).UDPPadding}
 	})
 	return nil
 }
@@ -513,6 +549,7 @@ type serverPacketWriter struct {
 	nat            N.PacketConn
 	session        *serverUDPSession
 	udpBlockCipher cipher.Block
+	padding        shadowsocks.UDPPaddingOptions
 }
 
 func (w *serverPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
@@ -522,7 +559,9 @@ func (w *serverPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 	}
 
 	var paddingLen int
-	if destination.Port == 53 && buffer.Len() < MaxPaddingLength {
+	if w.padding.Enabled {
+		paddingLen = w.paddingLength(buffer.Len(), destination)
+	} else if destination.Port == 53 && buffer.Len() < MaxPaddingLength {
 		paddingLen = mRand.Intn(MaxPaddingLength-buffer.Len()) + 1
 	}
 
@@ -603,6 +642,7 @@ type serverUDPSession struct {
 	packetId        uint64
 	cipher          cipher.AEAD
 	remoteCipher    cipher.AEAD
+	remoteKeyHash   [32]byte
 	window          SlidingWindow
 	rng             io.Reader
 }

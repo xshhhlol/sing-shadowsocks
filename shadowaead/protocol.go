@@ -30,7 +30,8 @@ var _ shadowsocks.Method = (*Method)(nil)
 
 func New(method string, key []byte, password string) (*Method, error) {
 	m := &Method{
-		name: method,
+		name:  method,
+		salts: &saltHistory{},
 	}
 	switch method {
 	case "aes-128-gcm":
@@ -81,6 +82,7 @@ type Method struct {
 	keySaltLength int
 	constructor   func(key []byte) (cipher.AEAD, error)
 	key           []byte
+	salts         *saltHistory
 }
 
 func (m *Method) Name() string {
