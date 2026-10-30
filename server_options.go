@@ -14,7 +14,8 @@ type ServerOptions struct {
 	UDPPadding       UDPPaddingOptions
 }
 
-// MaxPacketSize budgets the whole IP packet, including IP, UDP and SS headers.
+// UDPPaddingOptions budgets padding within the whole IP packet, including IP,
+// UDP and SS headers via MaxPacketSize.
 // Disabling the new policy restores the original DNS-only padding behavior.
 type UDPPaddingOptions struct {
 	Enabled         bool

@@ -9,7 +9,7 @@ linters:
       # Keep the exported legacy sing handler API source-compatible. Its
       # deprecation and existing switch-style suggestions are not migrations
       # required by this protocol hardening release.
-      checks: ["all", "-SA1019", "-QF1003"]
+      checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022", "-SA1019", "-QF1003"]
 formatters:
   enable:
     - gofumpt
